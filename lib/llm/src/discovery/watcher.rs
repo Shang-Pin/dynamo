@@ -1728,9 +1728,14 @@ impl ModelWatcher {
             };
             // Chat and completions on this decode endpoint share one prefill chooser.
             let prefill_chooser = prefill_receiver.map(|rx| {
-                // Create prefill-specific config with track_active_blocks disabled
-                let mut prefill_config = router_config.kv_router_config.clone();
-                prefill_config.router_track_active_blocks = false;
+                // DEEPINFRA: derive the prefill config via for_prefill_router()
+                // rather than clearing router_track_active_blocks alone. Inheriting
+                // router_track_output_blocks=true alongside
+                // router_track_active_blocks=false fails schema validation,
+                // prefill activation swallows the error, and disaggregated
+                // deployments silently degrade to decode-only passthrough
+                // (gpt-oss-120b-disagg outage, 2026-07-14 05:25-05:45 UTC).
+                let prefill_config = router_config.kv_router_config.for_prefill_router();
                 // Prefill KV events are emitted by prefill workers; do not inherit
                 // decode-only speculative hash mode.
                 let prefill_enable_eagle = false;
