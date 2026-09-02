@@ -691,6 +691,38 @@ impl EnginePerfModel {
         Ok(best)
     }
 
+    /// KV residency per decode slot.
+    ///
+    /// DEEPINFRA: prefer the measured value over `isl + osl/2`. That proxy is
+    /// arrival-weighted -- every request counts once when it shows up -- but a
+    /// decode slot is held for the whole generation, so the resident
+    /// population is length-biased: long requests carry more KV *and* occupy
+    /// their slot longer. Sampling by residency yields E[L^2]/E[L], not E[L],
+    /// and on skewed traffic those differ badly.
+    ///
+    /// Measured on DeepSeek-V4-Flash (1xB300, ISL p50=801 / p90=8.6k /
+    /// p99=115k, mean 5.6k): the proxy said 5,621 tokens per slot while
+    /// observed `sum_decode_kv_tokens / num_decode_requests` was 19,426 -- a
+    /// 3.5x understatement (implied CV~1.58). Every capacity probe therefore
+    /// landed 6-32x below the range the engine actually runs in, and the
+    /// resulting per-forward estimate collapsed to sub-millisecond
+    /// (`itl_ms=0.239` in production, against ~20ms measured end to end).
+    ///
+    /// `load_averages.avg_decode_len` already tracks exactly this quantity
+    /// from the FPM stream, so no new request field is needed. The bias factor
+    /// scales with workload skew, so no constant correction to the proxy would
+    /// work across models.
+    fn decode_context_length(&self, request: &EngineCapacityRequest) -> Result<u32> {
+        let measured = self.load_averages.avg_decode_len.value();
+        if measured > 0.0 {
+            // `.max(1)` keeps the >= 1 invariant the proxy had; callers divide
+            // by this to size the KV cap.
+            return ceil_positive_f64_to_u32(measured, "measured decode context length")
+                .map(|tokens| tokens.max(1));
+        }
+        Ok(fallback_decode_context_length(request))
+    }
+
     fn find_decode_capacity(
         &self,
         request: &EngineCapacityRequest,
@@ -699,7 +731,7 @@ impl EnginePerfModel {
             return Ok(None);
         }
         let accept_length = normalized_accept_length(request.accept_length);
-        let context_length = decode_context_length(request);
+        let context_length = self.decode_context_length(request)?;
         let max_batch = self.decode_max_batch(context_length);
         if max_batch == 0 {
             return Ok(None);
@@ -739,7 +771,7 @@ impl EnginePerfModel {
 
         let prefill_isl = effective_prefill_isl(request)?;
         let accept_length = normalized_accept_length(request.accept_length);
-        let context_length = decode_context_length(request);
+        let context_length = self.decode_context_length(request)?;
         let kv_cap = self.decode_max_batch(context_length);
         let hard_cap = cmp::min(
             kv_cap,
@@ -1244,7 +1276,9 @@ fn split_total(total: u32, ranks: usize, rank: usize) -> u32 {
     base + u32::from((rank as u32) < remainder)
 }
 
-fn decode_context_length(request: &EngineCapacityRequest) -> u32 {
+/// Arrival-weighted KV-residency proxy, used only before any decode
+/// observation has arrived. See `EnginePerfModel::decode_context_length`.
+fn fallback_decode_context_length(request: &EngineCapacityRequest) -> u32 {
     request.isl.saturating_add(request.osl / 2).max(1)
 }
 
@@ -2284,6 +2318,57 @@ mod tests {
         let many_seq_capacity = many_seq.find_engine_capacity_rps(request).unwrap().unwrap();
 
         assert!((one_seq_capacity.rps - many_seq_capacity.rps).abs() < 1e-9);
+    }
+
+    #[test]
+    fn decode_context_length_prefers_measured_residency_over_isl_proxy() {
+        // DEEPINFRA: shapes are the measured DeepSeek-V4-Flash values -- 72
+        // decode slots holding ~19.4k tokens each, against an arrival-weighted
+        // mean ISL of 5,461. The proxy understates residency 3.5x, which put
+        // every capacity probe far below the engine's real operating range.
+        let limits = EnginePerfLimits {
+            max_num_batched_tokens: 16_384,
+            max_num_seqs: 128,
+            max_kv_tokens: 12_700_000,
+        };
+        let mut model = EnginePerfModel::from_regression(
+            WorkerType::Aggregated,
+            limits,
+            Some(fast_options()),
+        )
+        .unwrap();
+        let request = EngineCapacityRequest {
+            isl: 5_461,
+            osl: 320,
+            ttft_sla: None,
+            itl_sla: None,
+            e2e_latency_sla: None,
+            accept_length: 3.138,
+            kv_hit_rate: None,
+            optimization_target: OptimizationTarget::Throughput,
+        };
+
+        // Cold start: nothing observed yet, so fall back to isl + osl/2.
+        assert_eq!(
+            model.decode_context_length(&request).unwrap(),
+            5_461 + 160,
+            "should fall back to the arrival-weighted proxy before any \
+             decode observation"
+        );
+
+        let residency = 19_426u64;
+        let training = vec![
+            vec![mixed_observation(0, 72, 72 * residency, 0.060)],
+            vec![mixed_observation(0, 72, 72 * residency, 0.061)],
+            vec![mixed_observation(8_192, 72, 72 * residency, 0.228)],
+        ];
+        model.tune_with_fpms(&training).unwrap();
+
+        assert_eq!(
+            model.decode_context_length(&request).unwrap(),
+            residency as u32,
+            "should use measured sum_decode_kv_tokens / num_decode_requests"
+        );
     }
 
     #[test]
