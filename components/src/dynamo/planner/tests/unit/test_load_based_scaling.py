@@ -756,6 +756,150 @@ class TestAggRegressionModel:
         assert rps_high > rps_zero
 
 
+# ── Decode/prefill regime separation (DEEPINFRA) ─────────────────────
+#
+# Shapes below mirror measured DeepSeek-V4-Flash traffic (1xB300, dspark
+# nextn=7, accept_length~3.14): pure-decode iterations land near 0.060s
+# while iterations carrying a prefill chunk land near 0.228s, and resident
+# KV per decode slot is ~19.4k rather than the arrival-weighted isl+osl/2.
+
+
+class TestAggRegimeSeparation:
+    ISL = 5461.0
+    OSL = 320.0
+    KV_PER_SLOT = 19_426
+    # Generative model fitted to the measured samples: a small positive KV
+    # slope plus a prefill term an order of magnitude more expensive per
+    # token. At 72 slots this yields 0.060s pure / 0.230s with an 8k prefill
+    # chunk, matching the observed medians. Coefficients must stay positive
+    # or _BaseRegressionModel._fit rejects the fit outright.
+    BASE_WT = 0.040
+    KV_COEF = 1.4e-8
+    PREFILL_COEF = 2.08e-5
+
+    def _wt(self, prefill_tok, kv):
+        return self.BASE_WT + self.KV_COEF * kv + self.PREFILL_COEF * prefill_tok
+
+    @property
+    def pure_decode_wt(self):
+        return self._wt(0, 72 * self.KV_PER_SLOT)
+
+    @property
+    def mixed_wt(self):
+        return self._wt(8192, 72 * self.KV_PER_SLOT)
+
+    def _train_bimodal(self, model, *, pure=True):
+        """Feed the two regimes at several batch sizes.
+
+        ``pure=False`` trains only the prefill-bearing regime, which is what
+        the pre-existing fixtures do and exercises the fallback path.
+        """
+        for nreq, prefill_tok in zip(
+            (40, 48, 56, 64, 72), (4096, 6144, 8192, 10240, 12288)
+        ):
+            kv = nreq * self.KV_PER_SLOT
+            if pure:
+                model.add_observation(
+                    _make_fpm(
+                        sum_prefill_tokens=0,
+                        num_prefill_requests=0,
+                        sum_decode_kv_tokens=kv,
+                        num_decode_requests=nreq,
+                        wall_time=self._wt(0, kv),
+                    )
+                )
+            model.add_observation(
+                _make_fpm(
+                    sum_prefill_tokens=prefill_tok,
+                    num_prefill_requests=2,
+                    sum_decode_kv_tokens=kv,
+                    num_decode_requests=nreq,
+                    wall_time=self._wt(prefill_tok, kv),
+                )
+            )
+
+    def test_itl_tracks_decode_regime_not_the_mixture(self):
+        """ITL must reflect a pure decode step, not the bimodal mean.
+
+        The mixed fit sees both regimes and lands between them; the decode
+        regime is the one that actually governs inter-token latency.
+        """
+        model = AggRegressionModel(
+            max_num_fpm_samples=200, min_observations=3, bucket_count=16
+        )
+        self._train_bimodal(model)
+
+        itl = model.estimate_next_itl(
+            scheduled_decode_kv=72 * self.KV_PER_SLOT, queued_decode_kv=0
+        )
+        assert itl is not None
+        # Within 25% of the pure-decode step, and nowhere near the 0.228s
+        # prefill-bearing regime or the ~0.14s mixture mean.
+        assert itl == pytest.approx(self.pure_decode_wt, rel=0.25)
+        assert itl < 0.5 * self.mixed_wt
+
+    def test_itl_falls_back_to_mixed_fit_before_regime_ready(self):
+        """No pure-decode samples yet -> previous behaviour, not None."""
+        model = AggRegressionModel(
+            max_num_fpm_samples=200, min_observations=3, bucket_count=16
+        )
+        self._train_bimodal(model, pure=False)
+
+        itl = model.estimate_next_itl(
+            scheduled_decode_kv=72 * self.KV_PER_SLOT, queued_decode_kv=0
+        )
+        assert itl is not None and itl > 0
+
+    def test_capacity_itl_is_physical(self):
+        """Regression guard for the sub-millisecond-ITL failure.
+
+        Previously the sweep derived ITL from the prefill-dominated mixed fit
+        probed at ``bs * (isl + osl/2)``, far below the observed KV range;
+        that reported itl_ms=0.239 and ~196 rps on a single B300 against ~6
+        rps of real per-engine demand. ITL must stay in a physical band and
+        capacity must stay within an order of magnitude of reality.
+        """
+        model = AggRegressionModel(
+            max_num_fpm_samples=200, min_observations=3, bucket_count=16
+        )
+        self._train_bimodal(model)
+
+        rps, ttft_ms, itl_ms = model.find_best_engine_agg_rps(
+            isl=self.ISL,
+            osl=self.OSL,
+            max_num_batched_tokens=16384,
+            ttft_sla=574.0,
+            itl_sla=46.0,
+            max_kv_tokens=12_700_000,
+            max_num_seqs=72,
+            kv_hit_rate=0.165,
+            accept_length=3.14,
+        )
+
+        # A forward pass on this engine cannot be sub-millisecond.
+        assert itl_ms > 1.0, f"unphysical ITL {itl_ms}ms"
+        # Expected ~19ms: 0.060s pure-decode step / 3.14 accept length.
+        assert itl_ms == pytest.approx(
+            1000.0 * self.pure_decode_wt / 3.14, rel=0.35
+        )
+        assert 0.0 < rps < 100.0, f"implausible engine capacity {rps} rps"
+        assert ttft_ms >= 0.0
+
+    def test_avg_ctx_uses_measured_residency(self):
+        """KV per slot comes from observations, not isl + osl/2.
+
+        The arrival-weighted proxy understated residency 3.5x on skewed
+        traffic, so the KV-capacity cap was correspondingly overstated.
+        """
+        model = AggRegressionModel(
+            max_num_fpm_samples=200, min_observations=3, bucket_count=16
+        )
+        self._train_bimodal(model)
+        assert model.avg_decode_length == pytest.approx(self.KV_PER_SLOT, rel=0.01)
+        # Measured residency exceeds the arrival-weighted proxy it replaces.
+        assert model.avg_decode_length > self.ISL + self.OSL / 2.0
+
+
 # ── Connector-driven refresh tests ──────────────────────────────────
 
 

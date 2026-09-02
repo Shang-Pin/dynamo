@@ -8,6 +8,8 @@ Regression:  wall_time = f(sum_prefill_tokens, sum_decode_kv_tokens)
 
 import logging
 import math
+import statistics
+from collections import deque
 from typing import Optional
 
 import numpy as np
@@ -23,7 +25,54 @@ logger = logging.getLogger(__name__)
 
 
 class AggRegressionModel(_BaseRegressionModel):
-    """2D regression for aggregated (chunked prefill + decode) engines."""
+    """2D regression for aggregated (chunked prefill + decode) engines.
+
+    DEEPINFRA: ``wall_time`` on an agg engine is a bimodal mixture. An
+    iteration that carries a chunked-prefill payload costs several times a
+    pure decode step, so a single fit over both regimes predicts the mixture
+    mean and is unusable for ITL. Measured on DeepSeek-V4-Flash (1588 live
+    FPM samples, 1xB300, dspark nextn=7):
+
+      * pure-decode iterations (``sum_prefill_tokens == 0``): median 0.060s
+      * iterations with a prefill chunk:                       median 0.228s
+      * the shipped ``f(sum_prefill_tokens, sum_decode_kv_tokens)`` fit:
+        R^2=0.595 with **109% mean absolute percentage error**
+
+    and critically all of that fit's signal comes from the prefill axis --
+    ``sum_decode_kv_tokens`` correlated r=-0.011 with wall_time (R^2=0.000
+    on its own, and still only R^2=0.002 *within* pure-decode samples across
+    a 7x KV range). So the axis the ITL estimate is derived from carries no
+    information, and the estimate is really driven by prefill work.
+
+    The fix is regime separation: decode-side quantities (ITL and the decode
+    egress rate) come from pure-decode observations only, while the mixed fit
+    is kept for prefill-side work (TTFT and prefill admission) -- which is
+    what its dominant axis actually measures.
+
+    Within the decode regime the step cost is treated as a **robust level,
+    not a regression**. Two properties of the data force this:
+
+      * there is no slope to fit -- decode_kv explains R^2=0.002 of
+        pure-decode wall_time across a 7x KV range, so a least-squares
+        coefficient is fitting noise;
+      * pure-decode wall_time is heavy-tailed (median 0.060s, mean 0.122s,
+        max 0.925s), so least squares is dragged toward the tail. Replaying
+        the 1588 live samples through a regression over just the pure-decode
+        subset predicted 288ms per forward (92ms ITL) against 20.2ms
+        measured -- worse than the bug it replaced.
+
+    A median over recent pure-decode observations gives 0.060s, i.e.
+    ``0.060/3.138 = 19.0ms`` ITL against 20.2ms measured end-to-end at the
+    frontend (6% error).
+
+    Consequence to be aware of: ITL no longer varies with resident KV, so it
+    cannot by itself signal decode pressure. That is faithful to the
+    measurement -- step time genuinely is flat in KV here, plausibly because
+    MLA's compressed KV keeps attention off the critical path -- and
+    pressure detection already lives in the KV-saturation thresholds
+    (``decode_kv_scale_up_threshold``) and queue depth. A workload that does
+    show real KV sensitivity would warrant revisiting the slope.
+    """
 
     def __init__(
         self,
@@ -39,6 +88,39 @@ class AggRegressionModel(_BaseRegressionModel):
         self._avg_prefill_tokens = _MovingAverage(max_num_fpm_samples)
         self._avg_num_prefill = _MovingAverage(max_num_fpm_samples)
         self._avg_num_decode = _MovingAverage(max_num_fpm_samples)
+        # Pure-decode wall times, newest last (see class docstring).
+        self._decode_steps: deque[float] = deque(maxlen=max_num_fpm_samples)
+        self._min_decode_steps = min_observations
+
+    def add_observation(self, fpm: ForwardPassMetrics) -> None:
+        super().add_observation(fpm)
+        # A pure-decode iteration is the only sample that says what a decode
+        # step costs; anything carrying a prefill chunk belongs to the other
+        # regime and would bias the level upward. wall_time == 0 is an idle
+        # heartbeat, not a measurement.
+        sched = fpm.scheduled_requests
+        if (
+            fpm.wall_time > 0.0
+            and sched.sum_prefill_tokens == 0
+            and sched.num_decode_requests > 0
+        ):
+            self._decode_steps.append(float(fpm.wall_time))
+
+    @property
+    def num_decode_step_observations(self) -> int:
+        return len(self._decode_steps)
+
+    def _decode_step_seconds(self) -> Optional[float]:
+        """Robust pure-decode step time, or ``None`` before enough samples.
+
+        Median rather than mean: the tail is real but unrepresentative of a
+        typical iteration, and callers compare against a central-tendency
+        SLA. Callers fall back to the mixed fit so a cold start degrades to
+        the previous estimate rather than failing.
+        """
+        if len(self._decode_steps) < self._min_decode_steps:
+            return None
+        return float(statistics.median(self._decode_steps))
 
     def _extract_x(self, fpm: ForwardPassMetrics) -> list[float]:
         sched = fpm.scheduled_requests
@@ -114,10 +196,17 @@ class AggRegressionModel(_BaseRegressionModel):
         scheduled_decode_kv: int,
         queued_decode_kv: int,
     ) -> Optional[float]:
-        """Estimate decode iteration time with piggybacked prefill.
+        """Estimate the next decode iteration time in seconds.
 
-        Returns estimated ITL in seconds, or None if the model is not ready.
+        Served by the pure-decode level (see class docstring), which is flat
+        in resident KV on the measured workload -- so the ``*_decode_kv``
+        arguments are only consulted by the mixed-fit fallback used until
+        enough pure-decode samples have arrived. Returns ``None`` if neither
+        estimator is ready.
         """
+        step = self._decode_step_seconds()
+        if step is not None:
+            return step
         if not self._ensure_fitted():
             return None
         total_kv = scheduled_decode_kv + queued_decode_kv + self._avg_decode_len.value
@@ -189,7 +278,25 @@ class AggRegressionModel(_BaseRegressionModel):
         prefill_scale = 1.0 - _clamp_kv_hit_rate(kv_hit_rate)
         effective_isl = isl * prefill_scale
 
-        avg_ctx = isl + osl / 2.0
+        # DEEPINFRA: KV residency per decode slot, measured.
+        #
+        # ``isl + osl/2`` is arrival-weighted -- every request counts once
+        # when it shows up -- but a decode slot is held for the whole
+        # generation, so the resident population is length-biased: long
+        # requests carry more KV *and* occupy their slot longer. Sampling by
+        # residency yields E[L^2]/E[L], not E[L], and on a skewed workload
+        # those differ badly. Measured on DeepSeek-V4-Flash (ISL p50=801,
+        # p90=8.6k, p99=115k, mean 5.6k): arrival-weighted avg_ctx said 5,621
+        # tokens/slot while observed sum_decode_kv_tokens/num_decode_requests
+        # was 19,426 -- a 3.5x understatement (implied CV~1.58), which put
+        # every probe of the regression 6-32x below the operating range.
+        #
+        # ``_avg_decode_len`` is exactly that residency-weighted mean and is
+        # already maintained from every FPM sample. Prefer it; fall back to
+        # the arrival-weighted proxy only before any decode sample has
+        # arrived. The bias factor scales with workload skew, so no constant
+        # correction to the proxy would work across models.
+        avg_ctx = self._avg_decode_len.value or (isl + osl / 2.0)
 
         # KV cache cap
         kv_cap = (
@@ -240,7 +347,12 @@ class AggRegressionModel(_BaseRegressionModel):
                 max_num_batched_tokens,
             )
             wt = self._predict_2d(prefill_per_iter, decode_kv)
-            itl_ms = wt * 1000.0 / accept_length
+            # Decode-side quantities (ITL, decode egress) come from the
+            # decode-regime fit; ``wt`` is a mixed-iteration cost dominated by
+            # prefill work and only describes prefill admission. Falls back to
+            # ``wt`` before the regime fit is ready.
+            decode_wt = self._decode_step_seconds() or wt
+            itl_ms = decode_wt * 1000.0 / accept_length
 
             # ``estimate_next_ttft`` applies the same discount internally to
             # both the queued portion and the avg_isl portion. To keep the
@@ -267,7 +379,7 @@ class AggRegressionModel(_BaseRegressionModel):
                         f"TTFT={ttft_ms:.1f}ms (target {ttft_sla:.1f}ms), "
                         f"ITL={itl_ms:.1f}ms (target {itl_sla:.1f}ms)"
                     )
-                    decode_rps = accept_length / (osl * wt)
+                    decode_rps = accept_length / (osl * decode_wt)
                     prefill_budget = max(0.0, float(max_num_batched_tokens - 1))
                     prefill_rps = (
                         math.inf
@@ -279,7 +391,7 @@ class AggRegressionModel(_BaseRegressionModel):
                     best_itl_ms = itl_ms
                 break
 
-            decode_rps = bs * accept_length / (osl * wt)
+            decode_rps = bs * accept_length / (osl * decode_wt)
             prefill_budget = max(0.0, float(max_num_batched_tokens - bs))
             prefill_rps = (
                 math.inf
