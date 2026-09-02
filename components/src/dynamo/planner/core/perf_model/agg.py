@@ -38,40 +38,53 @@ class AggRegressionModel(_BaseRegressionModel):
       * the shipped ``f(sum_prefill_tokens, sum_decode_kv_tokens)`` fit:
         R^2=0.595 with **109% mean absolute percentage error**
 
-    and critically all of that fit's signal comes from the prefill axis --
-    ``sum_decode_kv_tokens`` correlated r=-0.011 with wall_time (R^2=0.000
-    on its own, and still only R^2=0.002 *within* pure-decode samples across
-    a 7x KV range). So the axis the ITL estimate is derived from carries no
-    information, and the estimate is really driven by prefill work.
+    and every bit of that fit's signal is on the prefill axis:
+    ``sum_decode_kv_tokens`` correlates r=-0.011 with wall_time over the
+    whole mixture (R^2=0.000 on its own). So an ITL nominally derived from
+    resident KV was in practice driven by prefill work.
+
+    That near-zero raw correlation is a measurement artifact, not physics --
+    see below; the KV trend is real, just small relative to the tail.
 
     The fix is regime separation: decode-side quantities (ITL and the decode
     egress rate) come from pure-decode observations only, while the mixed fit
     is kept for prefill-side work (TTFT and prefill admission) -- which is
     what its dominant axis actually measures.
 
-    Within the decode regime the step cost is treated as a **robust level,
-    not a regression**. Two properties of the data force this:
+    Within the decode regime KV *does* still matter, but the trend is small
+    and buried under a heavy tail, so it has to be fitted robustly. On the
+    pure-decode subset:
 
-      * there is no slope to fit -- decode_kv explains R^2=0.002 of
-        pure-decode wall_time across a 7x KV range, so a least-squares
-        coefficient is fitting noise;
-      * pure-decode wall_time is heavy-tailed (median 0.060s, mean 0.122s,
-        max 0.925s), so least squares is dragged toward the tail. Replaying
-        the 1588 live samples through a regression over just the pure-decode
-        subset predicted 288ms per forward (92ms ITL) against 20.2ms
-        measured -- worse than the bug it replaced.
+      * raw least squares sees nothing (R^2=0.002) and, fitted directly,
+        predicts 288ms per forward against 20.2ms measured -- the tail
+        (median 0.060s, mean 0.122s, max 0.925s) captures the fit;
+      * medians within equal-count KV bins recover a clear trend:
+        r=+0.720, R^2=0.518, slope ~2.4e-9 s/token, intercept ~0.056s,
+        stable across 4/6/8 bins;
+      * holding ``num_decode_requests`` near its mode gives R^2=0.629 with
+        slope 1.85e-9, confirming the effect is resident KV rather than
+        batch size (the two correlate only r=-0.069).
 
-    A median over recent pure-decode observations gives 0.060s, i.e.
-    ``0.060/3.138 = 19.0ms`` ITL against 20.2ms measured end-to-end at the
-    frontend (6% error).
+    So the step cost is ``intercept + slope * decode_kv`` fitted over bin
+    medians. KV accounts for ~12% of the step across the observed range
+    (57ms at 471k tokens to 64ms at 3.25M), which matters: it is the
+    difference between an ITL estimate that tracks load and one that is
+    blind to it.
 
-    Consequence to be aware of: ITL no longer varies with resident KV, so it
-    cannot by itself signal decode pressure. That is faithful to the
-    measurement -- step time genuinely is flat in KV here, plausibly because
-    MLA's compressed KV keeps attention off the critical path -- and
-    pressure detection already lives in the KV-saturation thresholds
-    (``decode_kv_scale_up_threshold``) and queue depth. A workload that does
-    show real KV sensitivity would warrant revisiting the slope.
+    The slope's *sign* is dependable (75% of bootstrap resamples positive,
+    and every robust estimator agrees) but its *magnitude* is not -- the
+    bootstrap 95% CI spans [-1.5e-8, +7.6e-8] and half-sample splits give
+    3.4e-8/5.8e-8. An ill-determined slope is exactly how the 288ms
+    prediction happened, so predictions are clamped to measured territory:
+    ``decode_kv`` is clipped to the observed range and the result to the
+    p10..p90 of observed pure-decode wall_time. Both historical failures
+    here were extrapolations -- down to 0.75ms, up to 288ms -- and the clamp
+    is what makes either impossible.
+
+    Beyond the observed KV range the estimate therefore flattens rather than
+    extrapolating; the KV-saturation thresholds
+    (``decode_kv_scale_up_threshold``) are what cover a cache actually
+    filling up.
     """
 
     def __init__(
@@ -88,15 +101,25 @@ class AggRegressionModel(_BaseRegressionModel):
         self._avg_prefill_tokens = _MovingAverage(max_num_fpm_samples)
         self._avg_num_prefill = _MovingAverage(max_num_fpm_samples)
         self._avg_num_decode = _MovingAverage(max_num_fpm_samples)
-        # Pure-decode wall times, newest last (see class docstring).
-        self._decode_steps: deque[float] = deque(maxlen=max_num_fpm_samples)
+        # Pure-decode (decode_kv, wall_time) pairs, newest last.
+        self._decode_steps: deque[tuple[float, float]] = deque(
+            maxlen=max_num_fpm_samples
+        )
         self._min_decode_steps = min_observations
+        self._decode_fit: Optional[tuple[Optional[float], float]] = None
+        self._decode_bounds: Optional[tuple[float, float, float, float]] = None
+
+    # Bucket medians are fitted across this many equal-count KV bins. Chosen
+    # from the slope-stability sweep on the live samples: 4/6/8 bins all
+    # recover slope ~2.4e-9, while >=10 bins leave too few samples per bin
+    # for the median to settle and the slope jumps 10x (see class docstring).
+    _DECODE_FIT_BINS = 6
 
     def add_observation(self, fpm: ForwardPassMetrics) -> None:
         super().add_observation(fpm)
         # A pure-decode iteration is the only sample that says what a decode
         # step costs; anything carrying a prefill chunk belongs to the other
-        # regime and would bias the level upward. wall_time == 0 is an idle
+        # regime and would bias the estimate upward. wall_time == 0 is an idle
         # heartbeat, not a measurement.
         sched = fpm.scheduled_requests
         if (
@@ -104,23 +127,94 @@ class AggRegressionModel(_BaseRegressionModel):
             and sched.sum_prefill_tokens == 0
             and sched.num_decode_requests > 0
         ):
-            self._decode_steps.append(float(fpm.wall_time))
+            self._decode_steps.append(
+                (float(sched.sum_decode_kv_tokens), float(fpm.wall_time))
+            )
+            self._decode_fit = None
+            self._decode_bounds = None
 
     @property
     def num_decode_step_observations(self) -> int:
         return len(self._decode_steps)
 
-    def _decode_step_seconds(self) -> Optional[float]:
-        """Robust pure-decode step time, or ``None`` before enough samples.
+    def _ensure_decode_fit(self) -> None:
+        """Robust least squares over per-bin medians of the decode regime.
 
-        Median rather than mean: the tail is real but unrepresentative of a
-        typical iteration, and callers compare against a central-tendency
-        SLA. Callers fall back to the mixed fit so a cold start degrades to
-        the previous estimate rather than failing.
+        Raw least squares cannot be used here: pure-decode wall_time is
+        heavy-tailed, and fitting it directly scored R^2=0.002 while
+        predicting 288ms per forward against 20.2ms measured. Taking the
+        median within equal-count KV bins first suppresses the tail and
+        recovers the underlying trend (r=+0.720, R^2=0.518 across bins; and
+        R^2=0.629 once ``num_decode_requests`` is held near its mode, which
+        confirms the effect is KV and not batch size -- the two correlate
+        only r=-0.069).
+
+        A non-positive slope is unphysical (more resident KV cannot make a
+        decode step cheaper) and is treated as "no usable trend", falling
+        back to a flat level.
+        """
+        if self._decode_fit is not None or not self._decode_steps:
+            return
+        xs = np.array([kv for kv, _ in self._decode_steps], dtype=float)
+        ys = np.array([wt for _, wt in self._decode_steps], dtype=float)
+        # Extrapolation guards: never predict outside measured territory.
+        # Both historical failure modes here were extrapolations -- down to
+        # 0.75ms from the mixed fit, up to 288ms from raw least squares.
+        # Clipping decode_kv to the observed range is the real guard; the
+        # wall-time bound is an absolute backstop against a pathological
+        # slope, so it uses observed extremes rather than quantiles -- inner
+        # quantiles would compress predictions inside the operating range.
+        self._decode_bounds = (
+            float(xs.min()),
+            float(xs.max()),
+            float(ys.min()),
+            float(ys.max()),
+        )
+        level = float(statistics.median(ys))
+
+        edges = np.quantile(xs, np.linspace(0.0, 1.0, self._DECODE_FIT_BINS + 1))
+        bin_x: list[float] = []
+        bin_y: list[float] = []
+        for i in range(self._DECODE_FIT_BINS):
+            hi = edges[i + 1]
+            in_bin = (
+                (xs >= edges[i]) & (xs <= hi)
+                if i == self._DECODE_FIT_BINS - 1
+                else (xs >= edges[i]) & (xs < hi)
+            )
+            if in_bin.sum() >= 3:
+                bin_x.append(float(np.median(xs[in_bin])))
+                bin_y.append(float(np.median(ys[in_bin])))
+
+        if len(bin_x) < 3 or len(set(bin_x)) < 3:
+            self._decode_fit = (None, level)
+            return
+        slope, intercept = np.polyfit(np.array(bin_x), np.array(bin_y), 1)
+        if not np.isfinite(slope) or not np.isfinite(intercept) or slope <= 0.0:
+            self._decode_fit = (None, level)
+            return
+        self._decode_fit = (float(slope), float(intercept))
+
+    def _decode_step_seconds(
+        self, decode_kv_tokens: Optional[float] = None
+    ) -> Optional[float]:
+        """Pure-decode step time at ``decode_kv_tokens``.
+
+        Returns ``None`` before enough pure-decode samples have arrived, so
+        callers fall back to the mixed fit and a cold start degrades to the
+        previous behaviour rather than failing.
         """
         if len(self._decode_steps) < self._min_decode_steps:
             return None
-        return float(statistics.median(self._decode_steps))
+        self._ensure_decode_fit()
+        if self._decode_fit is None or self._decode_bounds is None:
+            return None
+        slope, intercept = self._decode_fit
+        if slope is None or decode_kv_tokens is None:
+            return intercept
+        kv_lo, kv_hi, wt_lo, wt_hi = self._decode_bounds
+        kv = min(max(float(decode_kv_tokens), kv_lo), kv_hi)
+        return min(max(intercept + slope * kv, wt_lo), wt_hi)
 
     def _extract_x(self, fpm: ForwardPassMetrics) -> list[float]:
         sched = fpm.scheduled_requests
@@ -198,18 +292,16 @@ class AggRegressionModel(_BaseRegressionModel):
     ) -> Optional[float]:
         """Estimate the next decode iteration time in seconds.
 
-        Served by the pure-decode level (see class docstring), which is flat
-        in resident KV on the measured workload -- so the ``*_decode_kv``
-        arguments are only consulted by the mixed-fit fallback used until
-        enough pure-decode samples have arrived. Returns ``None`` if neither
-        estimator is ready.
+        Served by the decode-regime fit (see class docstring); falls back to
+        the mixed fit until enough pure-decode samples have arrived. Returns
+        ``None`` if neither estimator is ready.
         """
-        step = self._decode_step_seconds()
+        total_kv = scheduled_decode_kv + queued_decode_kv + self._avg_decode_len.value
+        step = self._decode_step_seconds(total_kv)
         if step is not None:
             return step
         if not self._ensure_fitted():
             return None
-        total_kv = scheduled_decode_kv + queued_decode_kv + self._avg_decode_len.value
         return self._predict_2d(self._avg_prefill_tokens.value, total_kv)
 
     def find_best_engine_agg_rps(
@@ -351,7 +443,7 @@ class AggRegressionModel(_BaseRegressionModel):
             # decode-regime fit; ``wt`` is a mixed-iteration cost dominated by
             # prefill work and only describes prefill admission. Falls back to
             # ``wt`` before the regime fit is ready.
-            decode_wt = self._decode_step_seconds() or wt
+            decode_wt = self._decode_step_seconds(decode_kv) or wt
             itl_ms = decode_wt * 1000.0 / accept_length
 
             # ``estimate_next_ttft`` applies the same discount internally to

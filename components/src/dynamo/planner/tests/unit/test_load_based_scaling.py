@@ -789,34 +789,42 @@ class TestAggRegimeSeparation:
         return self._wt(8192, 72 * self.KV_PER_SLOT)
 
     def _train_bimodal(self, model, *, pure=True):
-        """Feed the two regimes at several batch sizes.
+        """Feed the two regimes across the batch-size range.
+
+        Enough distinct KV values to fill ``_DECODE_FIT_BINS`` bins with at
+        least 3 samples each -- below that the model correctly declines to
+        fit a trend and falls back to a level.
 
         ``pure=False`` trains only the prefill-bearing regime, which is what
         the pre-existing fixtures do and exercises the fallback path.
         """
-        for nreq, prefill_tok in zip(
-            (40, 48, 56, 64, 72), (4096, 6144, 8192, 10240, 12288)
-        ):
+        prefill_choices = (4096, 6144, 8192, 10240, 12288)
+        for i, nreq in enumerate(range(40, 73, 2)):
             kv = nreq * self.KV_PER_SLOT
-            if pure:
+            prefill_tok = prefill_choices[i % len(prefill_choices)]
+            for rep in range(3):
+                # Slight jitter so the per-bin median is doing real work
+                # rather than reading off a single exact value.
+                jitter = 1.0 + 0.01 * (rep - 1)
+                if pure:
+                    model.add_observation(
+                        _make_fpm(
+                            sum_prefill_tokens=0,
+                            num_prefill_requests=0,
+                            sum_decode_kv_tokens=kv,
+                            num_decode_requests=nreq,
+                            wall_time=self._wt(0, kv) * jitter,
+                        )
+                    )
                 model.add_observation(
                     _make_fpm(
-                        sum_prefill_tokens=0,
-                        num_prefill_requests=0,
+                        sum_prefill_tokens=prefill_tok,
+                        num_prefill_requests=2,
                         sum_decode_kv_tokens=kv,
                         num_decode_requests=nreq,
-                        wall_time=self._wt(0, kv),
+                        wall_time=self._wt(prefill_tok, kv) * jitter,
                     )
                 )
-            model.add_observation(
-                _make_fpm(
-                    sum_prefill_tokens=prefill_tok,
-                    num_prefill_requests=2,
-                    sum_decode_kv_tokens=kv,
-                    num_decode_requests=nreq,
-                    wall_time=self._wt(prefill_tok, kv),
-                )
-            )
 
     def test_itl_tracks_decode_regime_not_the_mixture(self):
         """ITL must reflect a pure decode step, not the bimodal mean.
@@ -884,6 +892,59 @@ class TestAggRegimeSeparation:
         )
         assert 0.0 < rps < 100.0, f"implausible engine capacity {rps} rps"
         assert ttft_ms >= 0.0
+
+    def test_itl_rises_with_resident_kv(self):
+        """The KV trend is small but real and must not be discarded.
+
+        Bin medians on live data give slope ~2.4e-9 s/token (r=+0.720),
+        ~12% of the step across the observed range. A flat level would
+        leave ITL blind to decode load.
+        """
+        model = AggRegressionModel(
+            max_num_fpm_samples=200, min_observations=3, bucket_count=16
+        )
+        self._train_bimodal(model)
+
+        lo = model.estimate_next_itl(
+            scheduled_decode_kv=40 * self.KV_PER_SLOT, queued_decode_kv=0
+        )
+        hi = model.estimate_next_itl(
+            scheduled_decode_kv=72 * self.KV_PER_SLOT, queued_decode_kv=0
+        )
+        assert lo is not None and hi is not None
+        assert hi > lo, f"ITL is flat in resident KV ({lo} -> {hi})"
+        # Queued work must also register as pressure.
+        queued = model.estimate_next_itl(
+            scheduled_decode_kv=40 * self.KV_PER_SLOT,
+            queued_decode_kv=20 * self.KV_PER_SLOT,
+        )
+        assert queued > lo
+
+    def test_itl_never_extrapolates_past_measured_range(self):
+        """Clamp guard: both historical failures were extrapolations.
+
+        The mixed fit extrapolated down to a 0.75ms forward pass; raw least
+        squares on the decode subset extrapolated up to 288ms. Neither may
+        be reachable regardless of the KV asked about.
+        """
+        model = AggRegressionModel(
+            max_num_fpm_samples=200, min_observations=3, bucket_count=16
+        )
+        self._train_bimodal(model)
+
+        at_max = model.estimate_next_itl(
+            scheduled_decode_kv=72 * self.KV_PER_SLOT, queued_decode_kv=0
+        )
+        for absurd_kv in (50_000_000, 500_000_000):
+            est = model.estimate_next_itl(
+                scheduled_decode_kv=absurd_kv, queued_decode_kv=0
+            )
+            assert est == pytest.approx(at_max, rel=1e-6), (
+                f"extrapolated to {est}s at kv={absurd_kv}"
+            )
+        # And nothing collapses toward zero at implausibly low KV.
+        tiny = model.estimate_next_itl(scheduled_decode_kv=1, queued_decode_kv=0)
+        assert tiny > 0.5 * self._wt(0, 40 * self.KV_PER_SLOT)
 
     def test_avg_ctx_uses_measured_residency(self):
         """KV per slot comes from observations, not isl + osl/2.
