@@ -23,7 +23,6 @@ pub(crate) use dynamo_kv_router::indexer::WireTieredMatchDetails;
 use dynamo_runtime::{
     component::Component, metrics::MetricsHierarchy, traits::DistributedRuntimeProvider,
 };
-use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 mod embedding_cache;
